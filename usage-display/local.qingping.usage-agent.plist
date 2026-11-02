@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Sends Claude / Codex usage numbers to the CGDN1 (cgdn1.local) usage pages.
+     /Users/YOUR_USER is a placeholder (launchd needs absolute paths); install with your home folder:
+       sed "s#/Users/YOUR_USER#$HOME#g" local.qingping.usage-agent.plist > ~/Library/LaunchAgents/local.qingping.usage-agent.plist &&
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.qingping.usage-agent.plist
+     Paths go through the stable symlink ~/qingping-flash/usage-agent (see README in the repo). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.qingping.usage-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOUR_USER/qingping-flash/venv/bin/python</string>
+    <string>-m</string>
+    <string>usage_display.agent</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOUR_USER/qingping-flash/usage-agent</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/Users/YOUR_USER/qingping-flash/usage-agent</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/qingping-flash/usage-agent/agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/qingping-flash/usage-agent/agent.log</string>
+</dict>
+</plist>

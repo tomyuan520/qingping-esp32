@@ -1,0 +1,5 @@
+.superpowers/
+agent.log
+__pycache__/
+.pytest_cache/
+.claude/

@@ -1,0 +1,1686 @@
+# ESPHome for the Qingping Air Monitor Lite (CGDN1). Install: docs/install.md.
+substitutions:
+  name: cgdn1
+  # "true" for the first, reversible install (every reboot returns to stock), see docs/install.md:
+  #   esphome -s trial_mode true compile cgdn1.yaml
+  trial_mode: "false"
+  # "true" for on-screen notifications and questions over MQTT (README; needs the mqtt_*
+  # secrets, packages/mqtt_true.yaml):
+  #   esphome -s mqtt_messages true compile cgdn1.yaml
+  mqtt_messages: "false"
+  # Reboot after this long with no API client. "0s" = never: without Home Assistant the
+  # installed unit would otherwise restart every 15 min. Trial installs want ESPHome's 15 min
+  # (it is their way back to stock):
+  #   esphome -s trial_mode true -s api_reboot_timeout 15min compile cgdn1.yaml
+  api_reboot_timeout: "0s"
+  # Build stamp for the dashboard's "Firmware" row (Device info), normally the git commit:
+  #   esphome -s fw_rev "$(git rev-parse --short HEAD)" compile cgdn1.yaml
+  fw_rev: "dev"
+  # Header bytes of the stock BLE broadcast, captured from stock 4.8.5: 88 24 <MAC reversed> 01 04 <T> <RH> 12 04 <PM2.5> <PM10> 13 02 <CO2>
+  ble_frame_control: "0x88"
+  ble_device_type: "0x24"
+
+packages:
+  mqtt_messages: !include packages/mqtt_${mqtt_messages}.yaml
+
+esphome:
+  name: ${name}
+  on_boot:
+    # Before WiFi starts (250), after preferences/globals: add the network saved with set_wifi.
+    - priority: 260
+      then:
+        - lambda: cgdn1_wifi::apply_saved();
+  # Keep the self-heating compensation's restore record current on a clean reboot/OTA
+  # (stock saves right before its reboots too). Shutdown runs in reverse setup-priority
+  # order: this trigger (600) -> globals (800, queues the NVS write) -> preferences (1000, sync).
+  on_shutdown:
+    - lambda: |-
+        if (id(tc_engine).ready()) {
+          id(tc_saved) = id(tc_engine).snapshot();
+          id(tc_heat_saved) = id(tc_engine).heat_snapshot();
+        }
+
+esp32:
+  board: esp32dev
+  flash_size: 4MB
+  # Partition table: the stock one, supplied by cgdn1_boot (do not set `partitions:`).
+  framework:
+    type: esp-idf
+    # IDF default is ERROR: raise to INFO so the wifi/phy driver lines reach the log
+    # (and the optional flash log, which is only 64 KB: not DEBUG/VERBOSE).
+    log_level: INFO
+    advanced:
+      # The stock bootloader (IDF 4.0.3) is kept and has no app rollback support.
+      enable_ota_rollback: false
+      # CGDN1 units ship with a factory-MAC eFuse that fails its CRC (Qingping's IDF fork skips the
+      # check). Without this the IDF WiFi driver runs as 00:00:00:00:00:00 and every auth ends
+      # "Auth Expired"; stock uses the raw MAC.
+      ignore_efuse_mac_crc: true
+    sdkconfig_options:
+      CONFIG_ESPTOOLPY_FLASHMODE_DIO: "y"
+      CONFIG_ESPTOOLPY_FLASHFREQ_80M: "y"
+      CONFIG_ESPTOOLPY_FLASHSIZE_4MB: "y"
+      CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: "n"
+      # NVS at 0x9000 still holds the stock firmware's WiFi/MQTT config (stock stays in the
+      # other OTA slot): keep IDF's WiFi/PHY components from writing their own namespaces into it.
+      CONFIG_ESP_WIFI_NVS_ENABLED: "n"
+      CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE: "n"
+      # Ongoing address conflict detection (RFC 5227) instead of a one-off ARP check: if another
+      # host claims our DHCP address twice within 10 s, lwIP declines it and gets a new lease.
+      # (Seen on the office guest WiFi: a printer that sleeps sometimes wakes up on our address.)
+      CONFIG_LWIP_DHCP_DOES_ARP_CHECK: "n"
+      CONFIG_LWIP_DHCP_DOES_ACD_CHECK: "y"
+
+logger:
+  level: DEBUG
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [cgdn1_boot, cgdn1_tcomp, cgdn1_display, cgdn1_touch, cgdn1_led, cgdn1_night, cgdn1_notify, cgdn1_info, cgdn1_wifi]
+
+# Power latch (GPIO23/13/18 HIGH from a global constructor, before anything else runs) and the
+# back-button long-press power-off. Must always be present: without it the unit switches itself off.
+cgdn1_boot:
+  id: boot
+  # Trial install: every boot marks the other OTA slot (the stock firmware this was installed
+  # from) as the next boot, so any reboot returns to stock. See docs/install.md. While this is
+  # on, do NOT use ESPHome's own OTA (dashboard / `esphome run` / HA update / captive portal
+  # upload): it writes the other slot and overwrites stock.
+  trial_mode: ${trial_mode}
+
+# Stock temperature/humidity self-heating compensation (components/cgdn1_tcomp/tcomp.h,
+# exact port of stock 4.8.5 "Sensor_Temp_Humi_Temp_Fix_Task"); wired up below: sht4x ->
+# 1 s interval -> "Temperature"/"Humidity" templates, restore record in NVS (globals).
+cgdn1_tcomp:
+
+# Stock RGB status LED logic (components/cgdn1_led/led.h: level thresholds, duties, blink);
+# wired up under "RGB status LED" below.
+cgdn1_led:
+
+# Stock night mode (components/cgdn1_night/night.h: window test, 1 s tick); wired up under
+# "Night mode" below.
+cgdn1_night:
+
+# Notifications and questions on the screen (components/cgdn1_notify/notify.h, ours); fed over
+# MQTT by packages/mqtt_true.yaml (substitution mqtt_messages), shown by the display lambda.
+cgdn1_notify:
+
+# Dashboard "Device info" texts and the factory-block readout (components/cgdn1_info).
+cgdn1_info:
+
+# One extra WiFi network set over the API (set_wifi / forget_wifi, components/cgdn1_wifi).
+cgdn1_wifi:
+
+# Free memory and the last reset reason for the dashboard's Device info group.
+debug:
+  update_interval: 60s
+
+wifi:
+  # Built-in network: the office WiFi. One more can be added at runtime: the dashboard's "Add WiFi"
+  # section on the fallback hotspot, or the API action set_wifi (tools/cgdn1_set_wifi.py).
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  ap:
+    ssid: "${name} Fallback"
+    password: !secret ap_password
+
+# No captive_portal: it auto-loads ota.web_server, and with web_server running on the LAN
+# that would expose a firmware upload (/update) that overwrites the stock slot. If no network is
+# in reach, join the fallback AP, open http://192.168.4.1 and use the "Add WiFi" section (or
+# tools/cgdn1_set_wifi.py --host 192.168.4.1).
+
+mdns:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    # Status LED white for the whole OTA, like stock's OTA screen (the transfer blocks the main
+    # loop, so the refresh is run right here instead of waiting for the 100 ms interval). On
+    # success it stays white until the reboot.
+    on_begin:
+      - lambda: id(led_ota) = true;
+      - script.execute: led_refresh
+    on_error:
+      - lambda: id(led_ota) = false;
+      - script.execute: led_refresh
+    on_abort:
+      - lambda: id(led_ota) = false;
+      - script.execute: led_refresh
+
+api:
+  # With no API client for this long ESPHome reboots (in trial mode -> stock); see substitutions.
+  reboot_timeout: ${api_reboot_timeout}
+  encryption:
+    key: !secret api_key
+  # Usage pages: the owner's Mac (~/qingping-flash/usage-display) sends numbers only. Encrypted and
+  # authenticated by the API key; out-of-range values are refused (usage_set).
+  actions:
+    - action: set_usage
+      variables:
+        service: string
+        five_hour: float
+        seven_day: float
+        account: string
+        age_s: int
+      then:
+        - lambda: |-
+            using namespace cgdn1_display;
+            const std::string svc = service.str();
+            UsageState *u = svc == "claude" ? &id(usage_claude) : svc == "codex" ? &id(usage_codex) : nullptr;
+            if (u == nullptr || !usage_set(*u, account.c_str(), account.size(), five_hour, seven_day, age_s, millis()))
+              ESP_LOGW("usage", "set_usage refused: service=%s 5h=%.1f 7d=%.1f age=%d", svc.c_str(), five_hour,
+                       seven_day, (int) age_s);
+    # One extra WiFi network next to the built-in ones, e.g. set over the fallback hotspot
+    # (tools/cgdn1_set_wifi.py). Saved in ESPHome's preferences under our own key, so it survives
+    # reflashes; replaced by the next set_wifi, removed by forget_wifi. The password is never logged.
+    - action: set_wifi
+      variables:
+        ssid: string
+        password: string
+      then:
+        - lambda: cgdn1_wifi::store(ssid.str(), password.str());
+    - action: forget_wifi
+      then:
+        - lambda: cgdn1_wifi::forget();
+
+# Browser dashboard and REST/event API at http://cgdn1.local, behind a login. Must not carry
+# a firmware upload: no `ota: - platform: web_server`, and no captive_portal (which adds one),
+# because any ESPHome OTA writes the other slot and overwrites stock. Plain HTTP: digest login
+# keeps the password off the network, but the readings are in clear, and its buttons (Restart,
+# Boot other firmware slot) can be pressed by a page forging requests in a logged-in browser.
+web_server:
+  port: 80
+  version: 3
+  local: true
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
+  # Read-only diagnostics (network, firmware, chip, memory) collected at the bottom of the page.
+  sorting_groups:
+    - id: grp_add_wifi
+      name: "Add WiFi"
+      sorting_weight: 90
+    - id: grp_device_info
+      name: "Device info"
+      sorting_weight: 100
+
+# Local wall clock for night mode, from Home Assistant over the API (its time zone too; stock
+# uses SNTP + its own time zone setting). Until the first sync the clock is invalid and night
+# mode does nothing, like stock before its clock is set.
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# Bluetooth proxy for Home Assistant (not in stock; stock's BLE is HomeKit/MiIO pairing only).
+# BLE shares the radio with WiFi (software coexistence) and keeps the CPU busier, so it adds
+# self-heat: the "Bluetooth" switch below stops/starts the BLE stack at runtime (also used by the
+# self-heating tests). Always on after a boot. Costs ~440 KB of the app slot.
+esp32_ble:
+  id: ble
+  enable_on_boot: true
+  # For the stock-compatible broadcast (interval "Qingping BLE broadcast" below)
+  advertising: true
+
+esp32_ble_tracker:
+
+# Passive: advertisements only, no GATT connections through this device. With active
+# connections the ESP32 BT controller blob asserted (r_assert in r_lld_con_start <-
+# hci_le_create_con_cmd_handler) after ~2 h of Home Assistant retrying a device that kept
+# failing to connect (every ~20 s). Connection-based devices need another HA Bluetooth adapter.
+bluetooth_proxy:
+  active: false
+
+button:
+  - platform: restart
+    name: "Restart"
+  # Boots the firmware in the other OTA slot: stock right after the install, the previous
+  # ESPHome image after an ESPHome OTA update. Refused (logged, no reboot) if that slot does
+  # not hold a valid image.
+  - platform: template
+    name: "Boot other firmware slot"
+    entity_category: config
+    on_press:
+      - lambda: id(boot).boot_other_slot();
+  # Writes a summary of stock's factory-info sector (flash 0x3d2000) to the log, tag "factory":
+  # only version-like text, 1-2 byte fields and our own MAC are shown; everything else (e.g. a
+  # HomeKit setup code) only as its length and character classes (info.h).
+  # Nothing is published; read it with `esphome logs` or the API log stream.
+  - platform: template
+    name: "Log factory info"
+    icon: mdi:chip
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    on_press:
+      - lambda: cgdn1_info::log_factory_block();
+  # "Add WiFi" section (components/cgdn1_wifi): saves the typed network next to the built-in one.
+  # Works only while the fallback hotspot is up (plain-HTTP dashboard; see extra_wifi.h).
+  - platform: template
+    name: "Connect to WiFi"
+    icon: mdi:wifi-arrow-right
+    web_server:
+      sorting_group_id: grp_add_wifi
+    on_press:
+      - lambda: |-
+          id(add_wifi_status).publish_state(cgdn1_wifi::connect_from_page());
+          id(add_wifi_ssid).publish_state("");
+
+# --- Air sensors (I2C bus 0) -------------------------------------------------
+# Pins/addresses from the stock 4.8.5 firmware (docs/hardware.md): bus 0 is
+# SDA=26/SCL=27 at 20 kHz in stock. The sensor rails (GPIO13/18) are already HIGH from
+# cgdn1_boot's constructor, so the parts are powered long before setup.
+# 0x10 on this bus is the Apple MFi authentication coprocessor that stock's HomeKit stack
+# talks to (esp-homekit-sdk esp_mfi_coprocessor.c, tag "mfi_i2c", FUN_400fd26c..400fd444:
+# regs 0x00 info, 0x10 auth control/status, 0x11 response, 0x20/0x21 challenge), not a sensor.
+# Bus 1 (SDA=12/SCL=14) is the ATtiny814 touch slider, see "Touch slider" below. The OLED
+# (SPI 5/4/15/2/22) is further down.
+i2c:
+  - id: bus_a
+    sda: GPIO26
+    scl: GPIO27
+    # Same as stock. Accepted by the IDF 5.5.5 i2c_master driver on ESP32; only the 10-bit
+    # start/stop setup fields truncate (2000 -> 976 APB cycles, ~12 us; spec minimum 4.7 us).
+    frequency: 20kHz
+    # Logs "Found device at address 0x.." in the config dump.
+    scan: true
+  # Bus 1: the ATtiny814 touch-slider controller @0x0C, exactly the stock config (platform_i2c_init
+  # FUN_400edc98, table 0x3ffbddf0 entry 1: HW port 1, SDA=12, SCL=14, 400 kHz; its i2c_config_t
+  # sets sda_pullup_en = scl_pullup_en = GPIO_PULLUP_ENABLE, i.e. the internal pull-ups ON, which
+  # is also ESPHome's default, so nothing extra is enabled here).
+  # GPIO12 = MTDI, the flash-voltage strapping pin, sampled at reset before any firmware runs: the
+  # board's own resistors set the strap (stock drives this bus, pull-ups and all, on the same
+  # hardware and boots/reboots fine). The I2C driver only uses it open-drain (it can pull low,
+  # never drive high; ESPHome's bus recovery at setup is open-drain too) and enables no pull-up
+  # that stock does not, so this changes nothing for the strap compared with stock.
+  - id: bus_b
+    sda:
+      number: GPIO12
+      ignore_strapping_warning: true  # see above
+    scl: GPIO14
+    frequency: 400kHz
+    # Stock i2c_set_timeout(1, 400000) (FUN_400edc98 -> 0x400f362c, table 0x3ffbddf0 entry 1
+    # +24): 400000 APB cycles = 5 ms of SCL low (clock stretching) before a timeout; the IDF
+    # default would be 2 ms. 5000 us x 80 cycles/us = the same register value.
+    timeout: 5ms
+    # No scan: it address-probes every device in WRITE mode, which stock never does to the ATtiny
+    # (read-only, see "Touch slider"). cgdn1_touch logs its probe read / idle checks instead.
+    scan: false
+
+sensor:
+  # SCD40 CO2 @0x62 (stock cmds 0x21b1/0x3f86 = start/stop periodic measurement).
+  - platform: scd4x
+    i2c_id: bus_a
+    address: 0x62
+    update_interval: 60s
+    co2:
+      id: co2
+      name: "CO2"
+    # The SCD40's own T/RH (self-heated, offset-compensated): diagnostic cross-check only.
+    temperature:
+      name: "CO2 sensor temperature"
+      entity_category: diagnostic
+    humidity:
+      name: "CO2 sensor humidity"
+      entity_category: diagnostic
+
+  # Plantower PMSA003I @0x12, I2C variant (stock reads the 32-byte "BM" 0x001C frame).
+  # standard_units (default) = atmospheric values, which is what stock consumes.
+  - platform: pmsa003i
+    i2c_id: bus_a
+    address: 0x12
+    update_interval: 60s
+    pm_1_0:
+      id: pm1
+      name: "PM1.0"
+    pm_2_5:
+      id: pm25
+      name: "PM2.5"
+    pm_10_0:
+      id: pm10
+      name: "PM10"
+
+  # T/RH @0x44 is a Sensirion SHT4x: the stock driver (FUN_400f0cac/0cd4/0e0c) sends the
+  # single-byte SHT4x commands 0x94 (soft reset), 0xFD (measure, high precision; then a
+  # 10 ms wait) and 0x89 (read serial), and converts RH = -6 + 125*raw/65535, a formula
+  # only SHT4x uses (SHT3x/HDC302x use 100*raw/65535 and 2-byte commands).
+  # These are the RAW readings (the board heats the sensor by ~6 C once warm): kept as
+  # diagnostics for comparison. The model in the 1 s interval below reads them with
+  # get_raw_state() (every 10 s reading); the throttle only limits what HA gets.
+  - platform: sht4x
+    i2c_id: bus_a
+    address: 0x44
+    update_interval: 10s  # heater stays off (default)
+    temperature:
+      id: t_raw
+      name: "Temperature (raw)"
+      entity_category: diagnostic
+      filters:
+        - throttle: 60s
+    humidity:
+      id: rh_raw
+      name: "Humidity (raw)"
+      entity_category: diagnostic
+      filters:
+        - throttle: 60s
+
+  # Compensated values, published by the 1 s interval every 10 s. Same names as the former
+  # sht4x entities so the HA entities (and their history) carry on.
+  - platform: template
+    id: temp_comp
+    name: "Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: rh_comp
+    name: "Humidity"
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  # Battery (stock Battery_Task FUN_400f1c90; init FUN_400f19c4):
+  # - GPIO39 / ADC1 ch3 is the battery, 11 dB (= IDF5 "12db") + esp_adc_cal. FUN_400f1b94
+  #   averages 5 samples and returns (pin_mV & 0x7fff) << 1: a 1:2 divider, so multiply 2.0.
+  - platform: adc
+    id: battery_voltage
+    pin: GPIO39
+    name: "Battery voltage"
+    attenuation: 12db
+    samples: 8
+    update_interval: 60s
+    device_class: voltage
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    filters:
+      - multiply: 2.0
+  # Stock voltage->percent table (DROM 0x3f409826, used by FUN_400f1acc/FUN_400f1b34): 101
+  # descending mV points for 100%..0%; a reading between points k+1 and k reports the upper
+  # point's percent, > 4199 mV is 100 and <= 2900 mV is 0. (Stock also only lets the value
+  # fall on battery and rise on USB; that ratchet is not reproduced here.)
+  - platform: copy
+    source_id: battery_voltage
+    id: battery_level
+    name: "Battery level"
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    filters:
+      - lambda: |-
+          static const uint16_t MV[101] = {
+            4200, 4150, 4140, 4102, 4080, 4062, 4050, 4042, 4034, 4028, 4023, 4018, 4014, 4009,
+            4004, 3998, 3991, 3982, 3973, 3963, 3951, 3940, 3929, 3916, 3914, 3907, 3892, 3882,
+            3872, 3861, 3852, 3844, 3834, 3826, 3817, 3808, 3799, 3790, 3780, 3771, 3761, 3751,
+            3741, 3731, 3721, 3710, 3700, 3689, 3679, 3669, 3659, 3649, 3639, 3630, 3622, 3613,
+            3605, 3598, 3590, 3583, 3577, 3570, 3565, 3566, 3556, 3550, 3544, 3537, 3531, 3526,
+            3519, 3513, 3508, 3502, 3495, 3489, 3482, 3475, 3468, 3460, 3452, 3444, 3434, 3425,
+            3415, 3403, 3392, 3380, 3366, 3353, 3342, 3330, 3319, 3308, 3295, 3281, 3266, 3243,
+            3213, 3100, 2900};
+          if (std::isnan(x)) return x;
+          const int mv = (int) lroundf(x * 1000.0f);
+          if (mv > 4199) return 100.0f;
+          if (mv <= 2900) return 0.0f;
+          int pct = 0;
+          for (int k = 0; k < 100; k++)  // same scan as stock: the last (lowest) match wins
+            if (MV[k] >= mv && MV[k + 1] <= mv) pct = 100 - k;
+          return (float) pct;
+  # GPIO35 / ADC1 ch7 is the charger's current-program (PROG/ISET) pin, not a battery tap.
+  # Stock samples it at 2.5 dB (adc1_config_channel_atten(7,1); 0..~1.25 V) and, on USB,
+  # converts it as (mV/1000)/2000*1000*1000 = pin_mV/2 mA, i.e. I = 1000 * V_PROG / 2 kOhm
+  # (LTC4054/TP4054-style monitor). Stock also reads it as a GPIO: low while Vbat <= 4.05 V
+  # means "charging", high or Vbat > 4.05 V means "charging done". At 12 dB the ADC floor
+  # (~0.14 V) would read as a bogus ~70 mA, hence 2.5 dB like stock.
+  # Even at 2.5 dB the calibrated ADC bottoms out at ~78 mV: on the unit this read a constant
+  # 39 mA with USB UNPLUGGED (Vbat 4.17 V, no charger current possible), i.e. the ADC floor,
+  # not current. So the floor is subtracted and the result clamped at 0 (a true ~0 reads 0;
+  # cgdn1_tcomp's "charger active" test, > 20 mA, now sees real current instead of the floor).
+  - platform: adc
+    id: charge_current
+    pin: GPIO35
+    name: "Charge current"
+    attenuation: 2.5db
+    samples: 8
+    update_interval: 60s
+    device_class: current
+    unit_of_measurement: mA
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters:
+      - multiply: 500.0  # V -> mA (pin_mV / 2)
+      - lambda: |-
+          static constexpr float ADC_FLOOR_MA = 39.0f;  // ~78 mV floor at 2.5 dB (see above)
+          return std::isnan(x) ? x : std::max(0.0f, x - ADC_FLOOR_MA);
+
+  # Heat-model diagnostics (ours, not stock): the display and Bluetooth heat the Measured model
+  # currently subtracts, published by the 1 s interval every 10 s (NaN until the engine is ok).
+  - platform: template
+    id: hc_display_heat
+    name: "Display heat estimate"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hc_bt_heat
+    name: "Bluetooth heat estimate"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+  - platform: copy
+    source_id: wifi_rssi
+    name: "WiFi signal %"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: ""
+    state_class: measurement
+    icon: mdi:wifi
+    entity_category: diagnostic
+    filters:
+      - lambda: return cgdn1_info::signal_pct(x);
+    web_server:
+      sorting_group_id: grp_device_info
+  - platform: debug
+    free:
+      name: "Free memory"
+      unit_of_measurement: kB
+      accuracy_decimals: 0
+      filters:
+        - multiply: 0.0009765625
+      web_server:
+        sorting_group_id: grp_device_info
+    min_free:
+      name: "Lowest free memory"
+      unit_of_measurement: kB
+      accuracy_decimals: 0
+      filters:
+        - multiply: 0.0009765625
+      web_server:
+        sorting_group_id: grp_device_info
+
+binary_sensor:
+  # Charge / USB-present: stock reads gpio_get_level(34)==0 (active-low). GPIO34 is
+  # input-only and has no internal pulls.
+  - platform: gpio
+    id: usb_power
+    pin:
+      number: GPIO34
+      mode: INPUT
+      inverted: true
+    name: "Charging"
+    device_class: battery_charging
+
+  # Back power button: stock reads GPIO36 active-low (pressed = 0) with an EXTERNAL pull-up
+  # (GPIO34-39 have no internal pulls: mode INPUT, no pullup). Holding it powers the board in
+  # hardware. Polled, not interrupt-driven: ESP32 erratum 3.11 glitches GPIO36 low while the
+  # SAR ADC (battery sensors above) samples. The initial state at boot fires no trigger.
+  - platform: gpio
+    id: power_button
+    name: "Power button"
+    pin:
+      number: GPIO36
+      mode: INPUT
+      inverted: true
+    use_interrupt: false
+    filters:
+      - delayed_on_off: 30ms  # debounce (stock: 50 ms ISR debounce, click >= 30 ms)
+    on_click:
+      min_length: 30ms
+      max_length: 1s
+      then:
+        - lambda: id(night_activity_ms) = millis();  # stock: a click clears the idle counters
+        # Stock toggles the display on a click (and so do we); HA also gets the event.
+        - switch.toggle: display_switch
+        - event.trigger:
+            id: power_button_event
+            event_type: click
+    on_press:
+      - lambda: id(night_activity_ms) = millis();  # stock: a push clears the idle counters
+      - script.execute: power_button_hold
+    on_release:
+      - script.stop: power_button_hold
+
+script:
+  # Long press = held 2 s, fired while still held (stock). The power-off itself (and its
+  # guards: armed only after a post-boot release, refused on USB power) is in cgdn1_boot.
+  - id: power_button_hold
+    mode: restart
+    then:
+      - delay: 2s
+      - if:
+          condition:
+            binary_sensor.is_on: power_button
+          then:
+            - event.trigger:
+                id: power_button_event
+                event_type: long_press
+            - lambda: id(boot).power_off_long_press();
+
+  # MQTT screen messages: light the panel for a newly shown message (unless "wake": false),
+  # publish the outcomes, redraw right away on a change (not at the next 125 ms update). Run
+  # after every change (message in, clear, gesture) and by the 100 ms interval (timeouts).
+  - id: notify_sync
+    then:
+      - lambda: |-
+          auto &nq = id(notify_q);
+          static size_t last_size = 0;
+          const bool fresh = nq.take_new_current();
+          bool changed = fresh || nq.size() != last_size;
+          last_size = nq.size();
+          if (fresh && nq.current().wake && !id(oled).is_on()) id(display_switch).turn_on();
+          for (const auto &o : nq.take_outcomes()) {
+            changed = true;
+            const std::string j = o.json();
+          #ifdef USE_MQTT  // mqtt_messages "true"
+            auto *mq = mqtt::global_mqtt_client;
+            if (!mq->publish(mq->get_topic_prefix() + "/notify/response", j))
+              ESP_LOGW("notify", "response not sent (MQTT down): %s", j.c_str());
+            else
+              ESP_LOGI("notify", "response %s", j.c_str());
+          #else
+            ESP_LOGI("notify", "response %s", j.c_str());
+          #endif
+          }
+          if (changed && id(oled).is_on()) id(oled).update();
+
+  # RGB status LED (stock RGB_LED_Task): pick the state, step the blink, write the duties. Run
+  # every 100 ms by the interval below and right away by the OTA triggers.
+  - id: led_refresh
+    then:
+      - lambda: |-
+          using namespace cgdn1_led;
+          Inputs in;
+          in.enabled = id(led_switch).state;
+          in.powering_off = id(boot).powering_off();
+          in.display_on = id(oled).is_on();
+          in.test_pattern = id(oled).get_test_pattern() != cgdn1_display::TEST_PATTERN_OFF;
+          in.ota = id(led_ota);
+          in.sensor = id(led_shown);
+          switch (in.sensor) {
+            case SENSOR_PM1: in.value = id(pm1).state; break;
+            case SENSOR_PM25: in.value = id(pm25).state; break;
+            case SENSOR_PM10: in.value = id(pm10).state; break;
+            case SENSOR_CO2: in.value = id(co2).state; break;
+            case SENSOR_TEMP: in.value = id(temp_comp).state; break;  // compensated, as displayed
+            case SENSOR_HUMI: in.value = id(rh_comp).state; break;
+            default: break;
+          }
+          // Stock: a sensor still warming up (no reading yet, status 1) -> LED off; E2 later ->
+          // blink. Same window as the page (make_page): loader = LED off, E2 = orange blink.
+          in.warming_up = millis() < cgdn1_display::LOADING_MAX_MS;
+          in.standard = static_cast<PmStandard>(id(led_pm_standard).active_index().value_or(0));
+          auto &led = id(led_engine);
+          const Colour before = led.colour();
+          const Rgb d = led.tick(in);
+          if (led.colour() != before)
+            ESP_LOGD("led", "%s (shown sensor %d)", colour_name(led.colour()), (int) in.sensor);
+          // Stock 10-bit duty / 1024. The ledc outputs run 13-bit at 5 kHz: round(d/1024 * 8191)
+          // = 8 * d exactly for every stock duty (1024 = steady on), so the duty cycles match.
+          id(led_r).set_level(d.r / 1024.0f);
+          id(led_g).set_level(d.g / 1024.0f);
+          id(led_b).set_level(d.b / 1024.0f);
+
+event:
+  - platform: template
+    id: power_button_event
+    name: "Power button press"
+    event_types:
+      - click
+      - long_press
+  - platform: template
+    id: touch_event
+    name: "Touch"
+    icon: mdi:gesture-swipe-horizontal
+    event_types:
+      - swipe_left
+      - swipe_right
+      - tap_left
+      - tap_centre
+      - tap_right
+      - long_touch
+
+# --- Touch slider (top edge; components/cgdn1_touch) ---------------------------------------
+# ATtiny814 @0x0C on bus_b, data-ready GPIO32 (input + pull-up, low = ready; stock FUN_400e2678 /
+# FUN_400e26a0). Gestures and thresholds are stock 4.8.5 (components/cgdn1_touch/gesture.h), the
+# read schedule too (schedule.h), run like stock's Touch_Task in its own 10 ms FreeRTOS task woken
+# by a GPIO32 interrupt, independent of the main loop. Like stock, a failing read never disables
+# the slider, and the idle chip is never read. Device-test lines: "Idle check: GPIO32=.., reads
+# .., touches .., truncated .., max first-sample latency .." (INFO, every 30 s without reads),
+# "raw .." (DEBUG, per touch), the gesture with "first +N ms" (INFO).
+# Actions follow stock (oled_task_sensor_page_callback FUN_400e36a0 and friends):
+#  - swipe_left (finger toward the left end) / tap_left  -> NEXT reading / page
+#    (stock: "left click" -> status 8 -> FUN_400e3e28 -> get_next_sensor; a drag toward the left
+#    end scrolls the pages forward)
+#  - swipe_right / tap_right -> PREVIOUS (stock: "right click" -> FUN_400e3c18 -> get_last_sensor)
+#  - tap_centre -> HA event only, like stock (no centre action). The display is turned off
+#    with the back button; a touch-driven toggle was too easy to trigger by accident.
+#  - display off: any touch turns it on and does nothing else (stock: a touch on the dark panel
+#    sets the display status back to on, FUN_400e36a0 bits 0x9c -> FUN_400e98e8(0))
+#  - long_touch (7.2 s still): HA event only (stock: network reset, not reproduced).
+#  - an MQTT message on screen (packages/mqtt_true.yaml): the gesture goes to it (answer / dismiss) and does
+#    not change the page.
+# Every gesture is also an HA event ("Touch"), the wake-up one included.
+cgdn1_touch:
+  id: touch
+  i2c_id: bus_b
+  data_ready_pin:
+    number: GPIO32
+    mode: INPUT_PULLUP
+    inverted: true
+  on_touch:
+    - lambda: |-
+        id(night_activity_ms) = millis();  // stock: every touched sample clears the idle counters
+        id(touch_wake) = !id(oled).is_on();
+        if (id(touch_wake)) id(display_switch).turn_on();
+  on_release:
+    - lambda: id(night_activity_ms) = millis();  # idle counts from the last touched sample
+  on_gesture:
+    - event.trigger:
+        id: touch_event
+        event_type: !lambda return gesture;
+    - lambda: |-
+        if (id(touch_wake)) return;  // this touch woke the panel: consumed
+        if (id(notify_q).active()) {  // a message is up: the gesture is for it, not the pages
+          id(notify_q).gesture(gesture);
+          id(notify_sync).execute();
+          return;
+        }
+        const uint32_t now = millis();
+        if (gesture == "swipe_left" || gesture == "tap_left") id(pages).next(now);
+        else if (gesture == "swipe_right" || gesture == "tap_right") id(pages).prev(now);
+
+# --- Self-heating compensation (stock 4.8.5, see components/cgdn1_tcomp/tcomp.h) -------
+# Stock subtracts the board's self-heat from the SHT4x reading with a per-second model:
+# T = T_raw + preheat(on) + discharging(dis) + bright(b) + (300-bst)/300 * charge_term,
+# slew-limited to 0.3 C/s for jumps > 3 C, then RH is moved to that T (Magnus ratio) and
+# x0.9 above 55 %RH raw. Steady state on USB, battery full, no display: T_raw - 5.98 C,
+# reached over ~2 h of uptime (-3.7 C at 20 min, -5.6 C at 1 h).
+globals:
+  - id: tc_engine
+    type: tcomp::Engine
+  # Restore record (stock config_store 0x16/0x17/0x18/0x1a equivalents). Stock keeps it in
+  # its raw-flash store at 0x3d0000, which we never write: this lives in NVS (namespace
+  # "esphome"). Refreshed every 5 min + on clean shutdown; one 10-byte blob, written only
+  # when changed and coalesced by the preferences flush (60 s) -> <= 1 NVS write / 5 min.
+  - id: tc_saved
+    type: tcomp::Saved
+    restore_value: true
+  # Restore record of the Measured heat model (components/cgdn1_tcomp/heat.h, ours, not stock):
+  # the two display cascades (p, q) and the Bluetooth lag, so the warm-up survives a reboot/OTA.
+  # NVS like tc_saved, refreshed every 5 min + on clean shutdown.
+  - id: tc_heat_saved
+    type: tcomp::heat::Saved
+    restore_value: true
+  # Display hook: mirrors id(oled).is_on(), refreshed by the 1 s interval below (stock feeds
+  # brightness target 100 while the panel is on, 0 when off; the -1 C term ramps 20 s/%).
+  # Feeds the Stock model only (on/off, stock never varies the OLED contrast); the Measured
+  # model takes "Display brightness" (level) itself, see the "Display heat" numbers.
+  - id: tc_display_on
+    type: bool
+    initial_value: "true"
+  # Stock page slider (cgdn1_display::PageSlider: slides FUN_400e3e28 / FUN_400e3c18): 8 pages
+  # (stock 5 + our Claude, Codex and info), a 10 px / 20 ms push slide on a touch only (no
+  # carousel; the info page alone slides on after 10 s); the touch slider chains
+  # next()/prev() (ignored before the first page is drawn). Stepped by update() in the lambda.
+  - id: pages
+    type: cgdn1_display::PageSlider
+  # Usage pages (components/cgdn1_display/usage_page.h): the last numbers the owner's Mac sent with
+  # the API action set_usage. Not restored: a boot shows "—" until the next send.
+  - id: usage_claude
+    type: cgdn1_display::UsageState
+  - id: usage_codex
+    type: cgdn1_display::UsageState
+  # Set at touch-down when that touch turned the dark panel on: its gesture does nothing else.
+  - id: touch_wake
+    type: bool
+    initial_value: "false"
+  # RGB status LED (components/cgdn1_led): the 100 ms state machine, the reading currently on
+  # screen (set by the display lambda every redraw; SENSOR_NONE = boot screen / info page) and the
+  # OTA flag.
+  - id: led_engine
+    type: cgdn1_led::Engine
+  - id: led_shown
+    type: cgdn1_led::Sensor
+    initial_value: cgdn1_led::SENSOR_NONE
+  - id: led_ota
+    type: bool
+    initial_value: "false"
+  # Night mode (components/cgdn1_night): the 1 s state machine and millis() of the last touch /
+  # back-button push or click (stock idle counters sys+0xa0/+0xa4).
+  - id: night_engine
+    type: cgdn1_night::Engine
+  # MQTT screen messages (components/cgdn1_notify): the shown one + the waiting ones.
+  - id: notify_q
+    type: cgdn1_notify::Queue
+  - id: night_activity_ms
+    type: uint32_t
+    initial_value: "0"
+
+# Dashboard "Add WiFi" section, for the fallback hotspot (http://192.168.4.1): type a network, press
+# "Connect to WiFi". The password box is not optimistic and not restored: its value is never published
+# as a state (so never sent to other dashboard or API clients) and lives in RAM until Connect wipes it.
+text:
+  - platform: template
+    id: add_wifi_ssid
+    name: "WiFi name"
+    icon: mdi:wifi
+    mode: text
+    max_length: 32
+    optimistic: true
+    web_server:
+      sorting_group_id: grp_add_wifi
+    set_action:
+      - lambda: cgdn1_wifi::set_pending_ssid(x);
+  - platform: template
+    name: "WiFi password"
+    icon: mdi:form-textbox-password
+    mode: password
+    max_length: 64
+    optimistic: false
+    web_server:
+      sorting_group_id: grp_add_wifi
+    set_action:
+      - lambda: |-
+          cgdn1_wifi::set_pending_password(x);
+          id(add_wifi_status).publish_state(cgdn1_wifi::page_status());
+
+number:
+  # Stock user calibration (cloud "temperature_offset"/"humidity_offset", config_store
+  # 0x43/0x45; the *_zoom variants are not exposed). Applied after the model, before the
+  # final clamps (T >= 0, RH 0..99.9).
+  - platform: template
+    id: tc_temp_offset
+    name: "Temperature offset"
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: -10
+    max_value: 10
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: tc_rh_offset
+    name: "Humidity offset"
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: -20
+    max_value: 20
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+  # Measured heat model (ours, not stock; selected by "Heat model"): the display and Bluetooth
+  # self-heating subtracted from T. Defaults = an on/off test fit of one unit (Bluetooth-on display
+  # edges, see heat.h) and equal heat::Params in components/cgdn1_tcomp/heat.h; NaN falls back
+  # to them there. Saved values win over these on an already-flashed device.
+  # Display heat at brightness 6: steady-state rise of the sensor.
+  - platform: template
+    id: hc_a6
+    name: "Display heat"
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 5
+    step: 0.05
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    mode: box
+  # Display heat at brightness 1 (levels in between are interpolated by panel current).
+  - platform: template
+    id: hc_a1
+    name: "Display heat at brightness 1"
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 5
+    step: 0.05
+    initial_value: 1.25
+    optimistic: true
+    restore_value: true
+    mode: box
+  # First display lag (fast part of the warm-up).
+  - platform: template
+    id: hc_tau_d1
+    name: "Display heat lag"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 10
+    max_value: 600
+    step: 5
+    initial_value: 110
+    optimistic: true
+    restore_value: true
+    mode: box
+  # Second display lag (slow soak of the case).
+  - platform: template
+    id: hc_tau_d2
+    name: "Display heat time"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 60
+    max_value: 3600
+    step: 10
+    initial_value: 1130
+    optimistic: true
+    restore_value: true
+    mode: box
+  # Steady-state rise while the Bluetooth stack is active.
+  - platform: template
+    id: hc_a_bt
+    name: "Bluetooth heat"
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 3
+    step: 0.05
+    initial_value: 1.6
+    optimistic: true
+    restore_value: true
+    mode: box
+  # Bluetooth lag.
+  - platform: template
+    id: hc_tau_bt
+    name: "Bluetooth heat time"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 60
+    max_value: 3600
+    step: 10
+    initial_value: 1070
+    optimistic: true
+    restore_value: true
+    mode: box
+  # OLED brightness as 6 discrete levels (every position visibly changes the screen), mapped to
+  # Cgdn1Display::set_brightness(%) as (level - 1) * 20 %; 6 = default/max, 1 still faintly lit
+  # (dark is the "Display" switch):
+  #  both panel variants: controller contrast 0x81 <byte>, level 6 = `contrast:` (stock 0xD0),
+  #  each level below 0.75 stop (x0.59 current) dimmer: 0xD0 7C 4A 2C 1A 0F. Lit pixels stay
+  #  gray 0xF like stock. (0x81 once looked dead on this panel: the driver raised CS after every
+  #  byte and the controller dropped the parameter; CS is now held low like stock.)
+  # Restored at boot: the number publishes its saved value before the display init, which then
+  # starts with it. (New id: the former 0..100 % number's saved value must not be reused.)
+  - platform: template
+    id: display_level
+    name: "Display brightness"
+    icon: mdi:brightness-6
+    entity_category: config
+    min_value: 1
+    max_value: 6
+    step: 1
+    initial_value: 6
+    optimistic: true
+    restore_value: true
+    mode: slider
+    on_value:
+      - lambda: id(oled).set_brightness((x - 1.0f) * 20.0f);
+
+interval:
+  # Qingping BLE broadcast: stock-format service data (UUID 0xFDCD: frame control, device type,
+  # MAC reversed, then type/length/value readings), so apps that read the stock advertisement
+  # (e.g. QingpingMenuBar's Bluetooth mode) keep working. A legacy advertisement is 31 bytes and
+  # can't carry every reading, so three small packets rotate: T/RH + CO2, PM + CO2, T/RH + battery
+  # (each <= 25 bytes, room left for an extra AD field). Off while the "Bluetooth" switch is off.
+  - interval: 3s
+    then:
+      - lambda: |-
+          static bool requested = false;
+          static uint8_t turn = 0;
+          if (!id(ble).is_active())
+            return;
+          if (!requested) {
+            id(ble).advertising_start();
+            requested = true;
+          }
+          uint8_t mac[6];
+          get_mac_address_raw(mac);
+          std::vector<uint8_t> d = {0xCD, 0xFD, ${ble_frame_control}, ${ble_device_type}};
+          for (int i = 5; i >= 0; i--)
+            d.push_back(mac[i]);
+          auto u16 = [&d](uint16_t v) {
+            d.push_back(v & 0xFF);
+            d.push_back(v >> 8);
+          };
+          auto ok = [](sensor::Sensor *s) { return s->has_state() && !std::isnan(s->state); };
+          auto add_trh = [&]() {
+            if (!ok(id(temp_comp)) || !ok(id(rh_comp)))
+              return;
+            d.insert(d.end(), {0x01, 0x04});
+            u16((uint16_t) (int16_t) lroundf(id(temp_comp).state * 10.0f));
+            u16((uint16_t) lroundf(id(rh_comp).state * 10.0f));
+          };
+          auto add_co2 = [&]() {
+            if (!ok(id(co2)))
+              return;
+            d.insert(d.end(), {0x13, 0x02});
+            u16((uint16_t) lroundf(id(co2).state));
+          };
+          if (turn == 0) {
+            add_trh();
+            add_co2();
+          } else if (turn == 1) {
+            if (ok(id(pm25)) && ok(id(pm10))) {
+              d.insert(d.end(), {0x12, 0x04});
+              u16((uint16_t) lroundf(id(pm25).state));
+              u16((uint16_t) lroundf(id(pm10).state));
+            }
+            add_co2();
+          } else {
+            add_trh();
+            if (ok(id(battery_level))) {
+              d.insert(d.end(), {0x02, 0x01});
+              d.push_back((uint8_t) lroundf(id(battery_level).state));
+            }
+          }
+          turn = (turn + 1) % 3;
+          if (d.size() > 10)  // header only = nothing to say yet
+            id(ble).advertising_set_service_data_and_name(d, false);
+  - interval: 100ms  # status LED: stock RGB_LED_Task period (blink = 2 on / 3 off ticks)
+    then:
+      - script.execute: led_refresh
+  - interval: 100ms  # MQTT screen messages: timeouts
+    then:
+      - lambda: id(notify_q).tick(millis());
+      - script.execute: notify_sync
+  # Slide cadence: stock redraws every 20 ms while a slide runs (10 px per frame). The slider is
+  # time-based, so a late frame only skips a position; the driver sends only changed frames (idle
+  # pages cost nothing here, the 125 ms display update_interval covers the bounce).
+  - interval: 20ms
+    then:
+      - lambda: 'if (id(pages).animating()) id(oled).update();'
+  - interval: 1s  # night mode: stock 1 s system task (FUN_400ea3f0)
+    then:
+      - lambda: |-
+          // An MQTT message on screen keeps the panel lit; night mode turns it off 5 s after.
+          if (id(notify_q).active() && id(oled).is_on()) id(night_activity_ms) = millis();
+          cgdn1_night::Inputs in;
+          in.enabled = id(night_switch).state;
+          in.pages_shown = id(pages).begun();  // past the boot screen
+          const ESPTime t = id(ha_time).now();
+          in.clock_valid = t.is_valid();
+          in.hour = t.hour;
+          in.minute = t.minute;
+          in.start = id(night_start).hour * 60 + id(night_start).minute;
+          in.end = id(night_end).hour * 60 + id(night_end).minute;
+          in.display_on = id(oled).is_on();
+          in.idle_s = id(touch).is_touched() ? 0 : (millis() - id(night_activity_ms)) / 1000;
+          auto &ne = id(night_engine);
+          const bool was = ne.active();
+          const cgdn1_night::Action a = ne.tick(in);
+          if (ne.active() != was)
+            ESP_LOGI("night", "%s (%02u:%02u, window %02u:%02u-%02u:%02u)", ne.active() ? "start" : "end",
+                     in.hour, in.minute, in.start / 60, in.start % 60, in.end / 60, in.end % 60);
+          if (a == cgdn1_night::Action::DISPLAY_OFF) id(display_switch).turn_off();
+          else if (a == cgdn1_night::Action::DISPLAY_ON) id(display_switch).turn_on();
+  - interval: 1s  # the stock model steps once per second: do not change
+    then:
+      - lambda: |-
+          auto &tc = id(tc_engine);
+          const bool was_ready = tc.ready();
+          tcomp::Inputs in;
+          in.t_raw = id(t_raw).get_raw_state();
+          in.rh_raw = id(rh_raw).get_raw_state();
+          in.usb = id(usb_power).state;  // GPIO34 low = USB present
+          in.vbat_mv = id(battery_voltage).state * 1000.0f;
+          in.ichg_ma = id(charge_current).state;
+          in.batt_pct = id(battery_level).state;
+          id(tc_display_on) = id(oled).is_on();
+          in.level = id(display_level).state;
+          in.ble = id(ble).is_active();
+          auto idx = id(hc_model).active_index();
+          in.measured = !idx.has_value() || *idx == 1;  // no value yet -> Measured
+          in.heat.a6 = id(hc_a6).state;
+          in.heat.a1 = id(hc_a1).state;
+          in.heat.tau_d1 = id(hc_tau_d1).state;
+          in.heat.tau_d2 = id(hc_tau_d2).state;
+          in.heat.a_bt = id(hc_a_bt).state;
+          in.heat.tau_bt = id(hc_tau_bt).state;
+          in.heat.bt_comp = id(hc_bt_comp).state;
+          in.bright_target = id(tc_display_on) ? 100 : 0;  // on/off only, not "Display brightness"
+          const float toff = id(tc_temp_offset).state, rhoff = id(tc_rh_offset).state;
+          in.cal.t_off_c100 = std::isnan(toff) ? 0 : (int) lroundf(toff * 100.0f);
+          in.cal.rh_off_d10 = std::isnan(rhoff) ? 0 : (int) lroundf(rhoff * 10.0f);
+          const bool ok = tc.tick(in, id(tc_saved), &id(tc_heat_saved));
+          const auto &st = tc.state();
+          if (ok && !was_ready)
+            ESP_LOGI("tcomp", "start: %s on=%d chg=%d cst=%d bacc=%d, heat %s (raw %.2f C)",
+                     id(tc_saved).magic == tcomp::SAVED_MAGIC ? "restored" : "cold",
+                     st.on, st.chg, st.cst, st.bacc, tc.heat_restored() ? "restored" : "seeded", in.t_raw);
+          if (!tc.ready() && tc.ticks() == 60)
+            ESP_LOGW("tcomp", "no SHT4x reading after 60 s: compensated T/RH unavailable");
+          if (tc.ticks() % 10 == 0) {
+            if (ok) {
+              id(temp_comp).publish_state(tc.out().t);
+              id(rh_comp).publish_state(tc.out().rh);
+              id(hc_display_heat).publish_state(tc.display_heat());
+              id(hc_bt_heat).publish_state(tc.bt_heat());
+            } else if (!std::isnan(id(temp_comp).state)) {
+              id(temp_comp).publish_state(NAN);
+              id(rh_comp).publish_state(NAN);
+              id(hc_display_heat).publish_state(NAN);
+              id(hc_bt_heat).publish_state(NAN);
+            }
+          }
+          if (ok && tc.ticks() % 300 == 0) {
+            id(tc_saved) = tc.snapshot();
+            id(tc_heat_saved) = tc.heat_snapshot();
+            ESP_LOGD("tcomp", "on=%d chg=%d dis=%d cst=%d bacc=%d H_d=%.2f H_bt=%.2f: raw %.2f C %.1f%% -> %.2f C %.1f%%",
+                     st.on, st.chg, st.dis, st.cst, st.bacc, tc.display_heat(), tc.bt_heat(),
+                     in.t_raw, in.rh_raw, tc.out().t, tc.out().rh);
+          }
+
+# --- On-board OLED (components/cgdn1_display) ---------------------------------------
+# 128x160 GUI, driven exactly like stock 4.8.5. Two factory panel variants, picked like stock
+# from the "lcd id" byte at flash 0x3d205d (1 = variant B, 4-bpp grayscale @ 8 MHz, tested;
+# anything else = variant A, 1-bpp SH1108-style @ 2 MHz, untested on hardware). HSPI mode 0, SCLK=5 MOSI=4, CS=15 / DC=2 / RST=22 as
+# GPIOs (stock: spics_io_num=-1). The SPI clock follows the variant.
+# GPIO2/5/15 are strapping pins; stock uses them for the OLED too (only sampled at reset).
+spi:
+  id: oled_spi
+  interface: hardware
+  clk_pin:
+    number: GPIO5
+    ignore_strapping_warning: true
+  mosi_pin: GPIO4
+
+# 1-bpp (no anti-aliasing) glyphs, limited glyph sets to keep the image small. Roboto Condensed
+# Black (900): the heaviest weight. Boot screen only: the readings use the extracted stock glyphs.
+font:
+  - file: "gfonts://Roboto Condensed@900"
+    id: f_text
+    size: 18
+    glyphs: &text_glyphs ' !%()+,-./0123456789:=?ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz°µ³'
+  - file: "gfonts://Roboto Condensed@900"
+    id: f_small
+    size: 16
+    glyphs: &all_glyphs
+      - ' !"#$%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~°µ³'
+      # Ukrainian + Russian Cyrillic, for MQTT messages
+      - 'АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯЁЪЫЭабвгґдеєжзиіїйклмнопрстуфхцчшщьюяёъыэ'
+      # Usage pages: "daybreak · 9m", "—" (no data yet)
+      - '·—'
+  # Info page and MQTT messages (ours): Bold (700) at 14 px fits 7 lines of ~25 characters;
+  # every printable ASCII character, so any network name shows as typed, + Cyrillic for messages
+  # (other characters are skipped). f_small (message hint row) and the message fonts below have
+  # the same set.
+  - file: "gfonts://Roboto Condensed@700"
+    id: f_info
+    size: 14
+    glyphs: *all_glyphs
+  # MQTT messages (ours): the title, and the text at the largest of 24 / 20 / 17 px (then f_info)
+  # that fits it whole.
+  - file: "gfonts://Roboto Condensed@900"
+    id: f_title
+    size: 18
+    glyphs: *all_glyphs
+  - file: "gfonts://Roboto Condensed@700"
+    id: f_msg24
+    size: 24
+    glyphs: *all_glyphs
+  - file: "gfonts://Roboto Condensed@700"
+    id: f_msg20
+    size: 20
+    glyphs: *all_glyphs
+  - file: "gfonts://Roboto Condensed@700"
+    id: f_msg17
+    size: 17
+    glyphs: *all_glyphs
+  # Usage pages (ours): the big percentages, "—" without data.
+  - file: "gfonts://Roboto Condensed@900"
+    id: f_usage_big
+    size: 30
+    glyphs: '0123456789%—'
+
+display:
+  - platform: cgdn1_display
+    id: oled
+    cs_pin:
+      number: GPIO15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+    reset_pin: GPIO22
+    # AUTO = stock probe (flash 0x3d205d == 1 -> B, else A). Force with A or B if needed.
+    variant: AUTO
+    # Diagnostic frame instead of the lambda (also switchable from HA, "Display test pattern"):
+    # off / orientation (borders, corner markers, up arrow + TOP, L/R, variant letter) /
+    # checkerboard (8 px squares) / white (all pixels).
+    test_pattern: "off"
+    # Upright landscape (160x128) per the stock glyph orientation; if the picture is upside
+    # down on the glass use 270 (flip_x/flip_y exist for a mirrored picture).
+    rotation: 90
+    # No flip: the top/bottom mirror once seen on the unit (and patched with flip_x: true) came
+    # from the driver raising CS after every byte, which made the controller drop the parameter
+    # of `DA C0` and run C0 (COM scan opposite to stock). CS is now held low like stock, so the
+    # stock C8 scan applies again. If the picture is upside down after all, put back
+    # `flip_x: true` (flip_x/flip_y act on panel axes; with rotation 90 panel X is vertical).
+    # Contrast at "Display brightness" 6 (100 %) and at init: stock's 0xD0. 0xFF = +23 % current.
+    contrast: 0xD0
+    # 8 redraws/s = the Bouncing step rate (1 px per step); slides are redrawn by the 20 ms
+    # interval above. The driver only sends a frame when it differs from the last one (Bouncing:
+    # every step, a variant-B frame is 10 KB = ~10 ms SPI at 8 MHz, so ~10 % of the main loop).
+    # The driver logs the measured cost once a minute ("redraws, frames sent; update avg/max").
+    update_interval: 125ms
+    lambda: |-
+      // 160 x 128 canvas, stock sensor pages (components/cgdn1_display/stock_page.h): ONE reading
+      // at a time as outline HUGE digits + the stock label icon ("%" on RH), PM2.5 -> PM10 -> CO2
+      // -> Claude -> Codex (ours: usage pages) -> T -> RH -> info (ours), starting on PM2.5 like
+      // stock. PageSlider = the stock slides FUN_400e3e28 / FUN_400e3c18: pages 160 px apart,
+      // pushed 10 px per 20 ms frame (snap <= 10 px), the ring wraps info -> PM2.5. The page
+      // changes on a touch only (tap/swipe toward the left end = next; no auto carousel), except
+      // the info page, which slides on to PM2.5 by itself after 10 s; a touch during a slide chains
+      // one more page (tap/swipe only, no finger-follow drag). The 8-dot indicator shows for 3 s after a touch,
+      // never permanently. No wifi/battery overlay: fixed pixels would burn in. The whole sensor
+      // page drifts (1 px per 125 ms diagonal, pong bounce) with the ink >= 3 px from the edges
+      // and >= 17 px from the top (clear of the indicator); the neighbour sliding in rides the
+      // same offset: the burn-in fix. The info page is plain text that stays put (it never stays
+      // on screen longer than 10 s). A sensor with no value draws the stock loader until 300 s
+      // of uptime, then "E2" (make_page).
+      const int W = it.get_width(), H = it.get_height();
+      const uint32_t now = millis();
+      const bool net = network::is_connected();
+      char buf[48];
+      auto ip4 = [&buf]() -> const char * {
+        for (auto &ip : network::get_ip_addresses())
+          if (ip.is_set() && ip.is_ip4()) return ip.str_to(buf);
+        return "--";
+      };
+
+      // ---- boot screen: from the very first frame until the network has been up 5 s (max 30 s)
+      static uint32_t net_t0 = 0;
+      if (!net) net_t0 = 0; else if (net_t0 == 0) net_t0 = now ? now : 1;
+      if (now < 30000 && (net_t0 == 0 || now - net_t0 < 5000)) {
+        id(led_shown) = cgdn1_led::SENSOR_NONE;  // status LED off on the boot screen (stock)
+        it.print(W / 2, 40, id(f_text), TextAlign::BASELINE_CENTER, "ESPHome");
+        it.print(W / 2, 60, id(f_small), TextAlign::BASELINE_CENTER, "Qingping CGDN1");
+        if (net) {
+          it.print(W / 2, 92, id(f_small), TextAlign::BASELINE_CENTER, "connected");
+          it.print(W / 2, 112, id(f_text), TextAlign::BASELINE_CENTER, ip4());
+        } else {
+          it.printf(W / 2, 92, id(f_small), TextAlign::BASELINE_CENTER, "starting%.*s", (int) (now / 500 % 4), "...");
+          it.print(W / 2, 112, id(f_small), TextAlign::BASELINE_CENTER, "network: connecting");
+        }
+        return;
+      }
+
+      // ---- MQTT message (components/cgdn1_notify): over the pages while one is queued. Title
+      // (f_title) + rule, the text wrapped and centred in the largest font that fits it whole
+      // (24 / 20 / 17 / 14 px), a question's hint row (f_small: what tap/swipe left, centre, right
+      // do) above a rule, and a 2 px bar at the bottom for the time left. The pages keep their
+      // state underneath; the status LED is off.
+      if (id(notify_q).active()) {
+        using namespace cgdn1_notify;
+        auto &nq = id(notify_q);
+        nq.shown(now);
+        id(led_shown) = cgdn1_led::SENSOR_NONE;
+        const Message &m = nq.current();
+        auto width_in = [&it](font::Font *f) -> Measure {
+          return [&it, f](const std::string &s) {
+            int x1, y1, w, h;
+            it.get_text_bounds(0, 0, s.c_str(), f, TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+            return w;
+          };
+        };
+        const Measure m_title = width_in(id(f_title)), m_small = width_in(id(f_small));
+        auto fit = [](const std::string &s, int w, const Measure &mw) { return mw(s) <= w ? s : ellipsize(s, w, mw); };
+        int top = 2, bottom = H - 4;  // body rows go in [top, bottom), the bar takes the last 2 rows
+        if (!m.title.empty()) {
+          it.print(W / 2, top, id(f_title), TextAlign::TOP_CENTER, fit(m.title, W - 4, m_title).c_str());
+          it.horizontal_line(0, top + 21, W);
+          top += 25;
+        }
+        const Hints hn = hints(m);
+        if (!hn.empty()) {
+          bottom = H - 22;
+          it.horizontal_line(0, bottom, W);
+          const int slot = hn.centre.empty() ? W / 2 - 4 : W / 3 - 4, y = bottom + 2;
+          if (!hn.left.empty()) it.print(2, y, id(f_small), TextAlign::TOP_LEFT, fit(hn.left, slot, m_small).c_str());
+          if (!hn.centre.empty())
+            it.print(W / 2, y, id(f_small), TextAlign::TOP_CENTER, fit(hn.centre, slot, m_small).c_str());
+          if (!hn.right.empty())
+            it.print(W - 2, y, id(f_small), TextAlign::TOP_RIGHT, fit(hn.right, slot, m_small).c_str());
+          bottom -= 2;
+        }
+        // Largest font first; the smallest takes whatever is left (cut with ".." if need be).
+        const struct { font::Font *f; int pitch; } sizes[] = {
+            {id(f_msg24), 25}, {id(f_msg20), 21}, {id(f_msg17), 18}, {id(f_info), 15}};
+        std::vector<std::string> lines;
+        font::Font *bf = nullptr;
+        int pitch = 0;
+        for (const auto &sz : sizes) {
+          bool cut = false;
+          lines = wrap(m.text, W - 4, (bottom - top) / sz.pitch, width_in(sz.f), &cut);
+          bf = sz.f;
+          pitch = sz.pitch;
+          if (!cut) break;
+        }
+        int y = top + ((bottom - top) - (int) lines.size() * pitch) / 2;
+        for (const auto &l : lines) {
+          it.print(W / 2, y, bf, TextAlign::TOP_CENTER, l.c_str());
+          y += pitch;
+        }
+        const int bar = (int) (W * nq.remaining(now) + 0.5f);
+        if (bar > 0) it.filled_rectangle(0, H - 2, bar, 2);
+        return;
+      }
+
+      {
+        using namespace cgdn1_display;
+        struct Entry {
+          PageKind kind;
+          float value;
+          cgdn1_led::Sensor led;  // the status LED shows the shown page's level (stock)
+          const UsageState *usage;  // set: a usage page (title + numbers from set_usage), not a reading
+          const char *title;
+          bool with_account;
+        };
+        const Entry pg[] = {
+            {PageKind::PM25, id(pm25).state, cgdn1_led::SENSOR_PM25, nullptr, nullptr, false},
+            {PageKind::PM10, id(pm10).state, cgdn1_led::SENSOR_PM10, nullptr, nullptr, false},
+            {PageKind::CO2, id(co2).state, cgdn1_led::SENSOR_CO2, nullptr, nullptr, false},
+            {PageKind::PM25, NAN, cgdn1_led::SENSOR_CLAUDE, &id(usage_claude), "Claude", false},
+            {PageKind::PM25, NAN, cgdn1_led::SENSOR_CODEX, &id(usage_codex), "Codex", true},
+            {PageKind::TEMP, id(temp_comp).state, cgdn1_led::SENSOR_TEMP, nullptr, nullptr, false},
+            {PageKind::HUMI, id(rh_comp).state, cgdn1_led::SENSOR_HUMI, nullptr, nullptr, false},
+        };
+        static constexpr int INFO = 7, COUNT = 8, FIRST = 0, STEP_MS = 125;  // FIRST = PM2.5
+        static_assert(sizeof(pg) / sizeof(pg[0]) == INFO, "pg[] holds every page before the info page");
+        static constexpr uint32_t INFO_DWELL_MS = 10000;
+        static bool started = false;
+        if (!started) {
+          started = true;
+          id(pages).begin(COUNT, now, FIRST);
+          id(pages).set_dwell(INFO, INFO_DWELL_MS);
+        }
+        id(pages).update(now);
+        const int shown = id(pages).page();  // flips halfway through a slide: LED and indicator
+        id(led_shown) = shown == INFO ? cgdn1_led::SENSOR_NONE : pg[shown].led;  // info: off
+        // Bounce range from the ink of the page the slide is heading to, from its first frame on
+        // (page() would swap ranges halfway, mid-screen). A narrower arriving range pulls the
+        // offset in <= 3 px per frame while sliding (no sideways jump); settled, it clamps at once.
+        // On the info page (which does not drift) the offset keeps bouncing in the range of the
+        // page after it, so that one slides in without a jump.
+        const int tgt = id(pages).target_page() == INFO ? (INFO + 1) % COUNT : id(pages).target_page();
+        const BounceRange b = pg[tgt].usage != nullptr
+                                  ? bounce_range(usage_ink(), W, H)
+                                  : bounce_range(page_ink(make_page(pg[tgt].kind, pg[tgt].value, now)), W, H);
+        static Bouncer pos;
+        pos.step_range(now, b.min_x, b.max_x, b.min_y, b.max_y, STEP_MS,
+                       id(pages).animating() ? BOUNCE_SLIDE_PULL : 0);
+        auto plot = [&it](int x, int y) { it.draw_pixel_at(x, y, display::COLOR_ON); };
+        for (int k = 0; k < COUNT; k++) {
+          const int px = id(pages).page_x(k);
+          if (px <= -W || px >= W) continue;  // only the shown page and the one sliding in/out
+          if (k != INFO && pg[k].usage != nullptr) {  // pg[] has no entry for the info page
+            // ---- usage page (components/cgdn1_display/usage_page.h): title, data age (and the
+            // Codex account) on top, then "5h" / "7d" with a big percentage and a bar each. Drifts
+            // with the sensor pages. Stale: hollow digits, empty bars; no data yet: "—".
+            const int ox = pos.x + px, oy = pos.y;
+            const UsageState &u = *pg[k].usage;
+            const UsageLook look = usage_look(u, now);
+            char corner[32];
+            usage_corner_text(u, now, pg[k].with_account, corner, sizeof(corner));
+            it.print(ox + USAGE_LABEL_X, oy + USAGE_TITLE_Y, id(f_info), TextAlign::TOP_LEFT, pg[k].title);
+            it.print(ox + USAGE_RIGHT_X, oy + USAGE_TITLE_Y, id(f_info), TextAlign::TOP_RIGHT, corner);
+            const char *const labels[2] = {"5h", "7d"};
+            const float vals[2] = {u.five_hour, u.seven_day};
+            for (int r = 0; r < 2; r++) {
+              const int y = oy + USAGE_ROW_Y[r], dx = ox + USAGE_DIGITS_X;
+              it.print(ox + USAGE_LABEL_X, y + 8, id(f_info), TextAlign::TOP_LEFT, labels[r]);
+              char num[8];
+              if (look == UsageLook::NONE)
+                snprintf(num, sizeof(num), "—");
+              else
+                snprintf(num, sizeof(num), "%d%%", usage_pct(vals[r]));
+              if (look == UsageLook::STALE) {  // hollow: the glyphs' 1 px outline only
+                for (int ex = -1; ex <= 1; ex++)
+                  for (int ey = -1; ey <= 1; ey++)
+                    if (ex != 0 || ey != 0)
+                      it.print(dx + ex, y + ey, id(f_usage_big), display::COLOR_ON, TextAlign::TOP_LEFT, num);
+                it.print(dx, y, id(f_usage_big), display::COLOR_OFF, TextAlign::TOP_LEFT, num);
+              } else {
+                it.print(dx, y, id(f_usage_big), TextAlign::TOP_LEFT, num);
+              }
+              const int by = y + USAGE_BAR_DY;
+              it.rectangle(ox + USAGE_BAR_X, by, USAGE_BAR_W, USAGE_BAR_H);
+              const int fill = look == UsageLook::FRESH ? usage_bar_fill(vals[r], USAGE_BAR_W - 2) : 0;
+              if (fill > 0)
+                it.filled_rectangle(ox + USAGE_BAR_X + 1, by + 1, fill, USAGE_BAR_H - 2);
+            }
+            continue;
+          }
+          if (k != INFO) {
+            draw_page(make_page(pg[k].kind, pg[k].value, now), pos.x + px, pos.y, plot);
+            continue;
+          }
+          // ---- info page: 7 rows of f_info (15 px pitch below the indicator), left text cut
+          // with ".." where it would run into the right-aligned part.
+          int row = 0;
+          auto line = [&](const char *left, const char *right = "") {
+            int x1, y1, rw = 0, lw, h;
+            if (*right) it.get_text_bounds(0, 0, right, id(f_info), TextAlign::TOP_LEFT, &x1, &y1, &rw, &h);
+            const int room = W - 4 - (rw ? rw + 6 : 0);
+            char cut[40];
+            snprintf(cut, sizeof(cut), "%s", left);
+            for (size_t n = strlen(cut);; n--) {
+              it.get_text_bounds(0, 0, cut, id(f_info), TextAlign::TOP_LEFT, &x1, &y1, &lw, &h);
+              if (lw <= room || n < 3) break;
+              strcpy(cut + n - 3, "..");  // drop one more character of the original each pass
+            }
+            const int y = 18 + 15 * row++;
+            it.print(px + 2, y, id(f_info), TextAlign::TOP_LEFT, cut);
+            if (*right) it.print(px + W - 2, y, id(f_info), TextAlign::TOP_RIGHT, right);
+          };
+          char l[48], r[16];
+          line("ESPHome " ESPHOME_VERSION);
+          const time_t built = App.get_build_time();
+          struct tm bt;
+          localtime_r(&built, &bt);
+          strftime(l, sizeof(l), "built %Y-%m-%d %H:%M", &bt);
+          line(l);
+          char mac[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
+          snprintf(l, sizeof(l), "MAC %s", get_mac_address_pretty_into_buffer(mac));
+          line(l);
+          auto *wf = wifi::global_wifi_component;
+          if (net) {
+            char ssid[wifi::SSID_BUFFER_SIZE];
+            snprintf(l, sizeof(l), "WiFi %s", wf->wifi_ssid_to(ssid));
+            snprintf(r, sizeof(r), "%d dBm", (int) wf->wifi_rssi());
+            line(l, r);
+            snprintf(l, sizeof(l), "IP %s", ip4());
+            line(l);
+          } else {
+            line("WiFi not connected");
+          }
+          if (wf->has_ap()) {
+            static const std::string ap_ssid = wf->get_ap().get_ssid().str();
+            snprintf(l, sizeof(l), "AP %s", ap_ssid.c_str());
+            line(l, wf->is_ap_active() ? "active" : "standby");
+          } else {
+            line("AP fallback: off");
+          }
+          const uint32_t up = (uint32_t) (millis_64() / 60000);  // minutes
+          if (up >= 24 * 60)
+            snprintf(r, sizeof(r), "up %ud %02uh", (unsigned) (up / 1440), (unsigned) (up / 60 % 24));
+          else if (up >= 60)
+            snprintf(r, sizeof(r), "up %uh %02um", (unsigned) (up / 60), (unsigned) (up % 60));
+          else
+            snprintf(r, sizeof(r), "up %um", (unsigned) up);
+          line(id(ble).is_active() ? "BT proxy on" : "BT proxy off", r);
+        }
+        if (id(pages).indicator_visible(now)) draw_page_dots(shown, COUNT, plot);
+        return;
+      }
+
+# --- RGB status LED (stock 4.8.5, components/cgdn1_led/led.h) -----------------------------
+# R = GPIO25, G = GPIO21, B = GPIO19, active-high, LEDC at 5 kHz like stock (stock: 10-bit; ESPHome
+# picks 13-bit for 5 kHz, duties scaled exactly x8). Driven directly by the led_refresh script every
+# 100 ms (no light/gamma/transitions: stock switches colours hard). It shows the level colour of the
+# reading currently on screen: PM2.5/PM10 green/yellow/orange/red/deep red/purple per "PM
+# standard", CO2 green/orange/red/deep red, T blue/green/yellow/orange, RH orange/yellow/green/
+# blue; no data: loader (first 300 s) = LED off, E2 = orange blink 200 ms on / 300 ms off; white
+# during OTA. Off while the display is off (night mode included), on the boot screen, with a display test pattern,
+# during power-off, or with the "LED" switch off.
+output:
+  - platform: ledc
+    id: led_r
+    pin: GPIO25
+    frequency: 5000Hz
+  - platform: ledc
+    id: led_g
+    pin: GPIO21
+    frequency: 5000Hz
+  - platform: ledc
+    id: led_b
+    pin: GPIO19
+    frequency: 5000Hz
+
+select:
+  # Temperature model (ours, not stock): "Stock" = the original 4.8.5 brightness/charge terms
+  # only, "Measured" = adds the display (brightness-dependent) and Bluetooth heat measured on
+  # the device ("Display heat" / "Bluetooth heat" numbers) and moves RH to the compensated T at
+  # constant vapour pressure (stock's transfer reads ~4-6 %RH high, see tcomp.h).
+  # Restored; Measured first boot.
+  - platform: template
+    id: hc_model
+    name: "Heat model"
+    icon: mdi:thermometer-lines
+    entity_category: config
+    options: ["Stock", "Measured"]
+    initial_option: "Measured"
+    optimistic: true
+    restore_value: true
+
+  # PM2.5/PM10 LED thresholds (stock ucPm25Standard 0/1/2 tables; China = stock default):
+  # PM2.5 <= 35/75/115/150/250 (China), 12/35/55/150/250 (US), 14/29/54/109 (EU);
+  # PM10 < 50/150/250/350/420 (China), 54/154/254/354/424 (US), 24/49/89/179 (EU).
+  - platform: template
+    id: led_pm_standard
+    name: "PM standard"
+    icon: mdi:air-filter
+    entity_category: config
+    options: ["China", "US", "EU"]
+    initial_option: "China"
+    optimistic: true
+    restore_value: true
+
+  # Display diagnostics: draws a fixed frame instead of the normal pages while not "off".
+  # orientation: TOP + arrow should point up and read normally, solid square top-left, hollow
+  # square top-right, solid triangle bottom-left, X bottom-right, L left, R right, and the panel
+  # variant letter (A/B) at the bottom; outer border = extreme pixels, inner border 2 px in.
+  - platform: template
+    id: display_test_pattern
+    name: "Display test pattern"
+    icon: mdi:test-tube
+    entity_category: config
+    options: ["off", "orientation", "checkerboard", "white"]
+    initial_option: "off"
+    optimistic: true
+    set_action:
+      - lambda: id(oled).set_test_pattern(x.c_str());
+
+# --- Night mode (stock 4.8.5, components/cgdn1_night/night.h) ------------------------------
+# Stock night_mode_start_time / night_mode_end_time: inside the daily window [start, end) (may
+# cross midnight; start == end = never) the display, and with it the status LED, goes off once
+# nothing touched the slider or the back button for 5 s; a touch or a click lights it as usual
+# and it goes dark again 5 s later. Leaving the window (or switching night mode off inside it)
+# turns a dark display back on, once. Stock has no on/off: start or end 0 means off, so 00:00
+# could not be a start or end there; here the "Night mode" switch does that and 00:00 is a
+# normal time. Restored across reboots; off by default like stock (0/0).
+datetime:
+  - platform: template
+    id: night_start
+    type: time
+    name: "Night mode start"
+    icon: mdi:weather-night
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: "22:00:00"
+  - platform: template
+    id: night_end
+    type: time
+    name: "Night mode end"
+    icon: mdi:weather-sunny
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: "07:00:00"
+
+text_sensor:
+  - platform: template
+    name: "Display panel"
+    icon: mdi:monitor
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    update_interval: 60s
+    lambda: return id(oled).variant_summary();
+  # Device info (dashboard group): fixed values are computed once and re-published every 10 min.
+  - platform: template
+    name: "Device name"
+    icon: mdi:label-outline
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    update_interval: 600s
+    lambda: return App.get_name().str() + " (" + App.get_name().str() + ".local)";
+  - platform: wifi_info
+    ip_address:
+      name: "IP address"
+      web_server:
+        sorting_group_id: grp_device_info
+    mac_address:
+      name: "MAC address"
+      web_server:
+        sorting_group_id: grp_device_info
+    ssid:
+      name: "WiFi network"
+      web_server:
+        sorting_group_id: grp_device_info
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    format:
+      separator: " "
+    web_server:
+      sorting_group_id: grp_device_info
+  - platform: template
+    name: "Firmware"
+    icon: mdi:package-variant
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    update_interval: 600s
+    lambda: |-
+      static const std::string s = [] {
+        char built[Application::BUILD_TIME_STR_SIZE];
+        App.get_build_time_string(built);
+        return cgdn1_info::firmware_text(ESPHOME_VERSION, "${fw_rev}", built);
+      }();
+      return s;
+  - platform: template
+    name: "Firmware slots"
+    icon: mdi:swap-horizontal
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    update_interval: 600s
+    lambda: |-
+      static const std::string s = cgdn1_info::slots_now();
+      return s;
+  - platform: template
+    name: "Chip"
+    icon: mdi:chip
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    update_interval: 600s
+    lambda: |-
+      static const std::string s = cgdn1_info::chip_now();
+      return s;
+  - platform: template
+    name: "Flash chip"
+    icon: mdi:memory
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    update_interval: 600s
+    lambda: |-
+      static const std::string s = cgdn1_info::flash_now();
+      return s;
+  - platform: template
+    name: "Extra WiFi"
+    icon: mdi:wifi-plus
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_device_info
+    update_interval: 30s
+    lambda: return cgdn1_wifi::saved_label();
+  - platform: template
+    id: add_wifi_status
+    name: "Add WiFi status"
+    icon: mdi:information-outline
+    web_server:
+      sorting_group_id: grp_add_wifi
+    update_interval: 5s
+    lambda: return cgdn1_wifi::page_status();
+  - platform: debug
+    reset_reason:
+      name: "Last reset"
+      web_server:
+        sorting_group_id: grp_device_info
+
+switch:
+  # Status LED on/off (not in stock, where only the display switch darkens it). Restored, on by
+  # default; the 100 ms refresh applies it.
+  - platform: template
+    id: led_switch
+    name: "LED"
+    icon: mdi:led-on
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # Night mode on/off (see "Night mode" above). Restored, off by default (stock 0/0 = off).
+  - platform: template
+    id: night_switch
+    name: "Night mode"
+    icon: mdi:weather-night
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # Apply the Bluetooth heat term in the Measured model (ours, not stock). Restored, on by default.
+  - platform: template
+    id: hc_bt_comp
+    name: "Bluetooth heat compensation"
+    icon: mdi:bluetooth-settings
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # BLE stack (Bluetooth proxy) on/off at runtime. DISABLED restore: on after every boot.
+  - platform: template
+    id: ble_switch
+    name: "Bluetooth"
+    icon: mdi:bluetooth
+    entity_category: config
+    restore_mode: DISABLED
+    lambda: return id(ble).is_active();
+    turn_on_action:
+      - ble.enable:
+    turn_off_action:
+      - ble.disable:
+
+  # Panel on/off (HA + the back-button click). DISABLED restore: no action at boot, the
+  # driver starts lit. Off = controller display-off (AE), like stock's click.
+  - platform: template
+    id: display_switch
+    name: "Display"
+    icon: mdi:monitor
+    restore_mode: DISABLED
+    lambda: return id(oled).is_on();
+    turn_on_action:
+      - lambda: id(oled).turn_on();
+    turn_off_action:
+      - lambda: id(oled).turn_off();
